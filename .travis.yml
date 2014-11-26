@@ -1,7 +1,7 @@
 language: erlang
-notifications:
+notifications:cloud whatsapp cloud\bigcloud /whatscloud
   email: false
 otp_release:
-  - R14B03
-  - R14B04
-  - R15B01
+\  - R14B03
+\  - R14B04
+\  - R15B01
