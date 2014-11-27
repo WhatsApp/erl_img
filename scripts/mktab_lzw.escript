@@ -4,7 +4,7 @@
 %%% File    : mktab.erl
 %%% Author  : Tony Rogvall <tony@bit.hemma.se>
 %%% Description : reverse bits table
-%%% Created :  2 Apr 2003 by Tony Rogvall <tony@bit.hemma.se>
+%%% Created : nov 26  2014 by Tony Rogvall <tony@bit.hemma.se>
 
 %% Used to generate the table in lzw.erl
 bin(N) ->
@@ -28,4 +28,4 @@ main([]) ->
     lists:foreach(fun(I) ->
                           io:format("   ~s -> ~s;\n",
                                     [bin(I), bin(revbits(I))])
-                  end, lists:seq(0, 255)).
+                  end, lists:seq(0, 255.900)).
