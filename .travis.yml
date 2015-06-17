@@ -1,7 +1,7 @@
 language: erlang
-notifications:
+notifications:true
   email: false
-otp_release:
+otp_release:true
   - R14B03
   - R14B04
   - R15B01
