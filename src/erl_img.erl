@@ -17,8 +17,10 @@
 -export([load/1, save/1, save/2, to_binary/1]).
 -export([attribute/2, attribute/3, set_attribute/3]).
 -export([extensions/1]).
+-export([read_info/2]).
 -export([write_info/3]).
 -export([hex32/1, hex16/1, hex8/1]).
+-export([crop/5, scale/2, scale/3]).
 
 hex32(X) ->
     hex8(X bsr 24) ++ hex8(X bsr 16) ++ hex8(X bsr 8) ++ hex8(X).
@@ -112,9 +114,13 @@ read_file_info(File) ->
         Error  -> Error
     end.
 
-
+load(Binary) when is_binary(Binary) ->
+	load_opt(Binary, [ram, binary, read]);
 load(File) ->
-    case file:open(File, [raw, binary, read]) of
+	load_opt(File, [raw, binary, read]).
+
+load_opt(File, Opts) ->
+    case file:open(File, Opts) of
         {ok,Fd} ->
             Res = case read_magic_info(Fd) of
                       {ok, IMG} ->
@@ -153,9 +159,6 @@ to_binary(IMG) ->
         Error ->
             Error
     end.
-
-
-
 
 read_info(Type, Fd) ->
     file:position(Fd, 0),
@@ -212,3 +215,244 @@ dir_list([File|Fs], Dir) ->
     end;
 dir_list([], _Dir) ->
     [].
+
+
+crop(#erl_image{ width = Width, height = Height } = IMG, Width, Height, 0, 0) ->
+    IMG;
+crop(IMG, Width, Height, XOffset, YOffset) when YOffset > 0 ->
+    IMG1 = IMG#erl_image{ 
+        pixmaps = lists:foldr(fun
+                (PixMap, Acc) when PixMap#erl_pixmap.top + PixMap#erl_pixmap.height < YOffset ->
+                    Acc;
+                (PixMap, Acc) when PixMap#erl_pixmap.top >= YOffset ->
+                    [PixMap#erl_pixmap{ top = PixMap#erl_pixmap.top - YOffset }|Acc];
+                (PixMap, Acc) ->
+                    [PixMap#erl_pixmap{ 
+                            pixels = lists:map(fun({RowNum, Data}) ->
+                                        {RowNum - YOffset, Data}
+                                end, lists:nthtail(YOffset - PixMap#erl_pixmap.top, 
+                                    lists:sort(fun({RowA, _}, {RowB, _}) ->
+                                                RowA < RowB
+                                        end, PixMap#erl_pixmap.pixels))),
+                            height = PixMap#erl_pixmap.height - (YOffset - PixMap#erl_pixmap.top),
+                            top = 0} | Acc]
+            end, [], IMG#erl_image.pixmaps),
+        height = IMG#erl_image.height - YOffset},
+    crop(IMG1, Width, Height, XOffset, 0);
+crop(IMG, Width, Height, XOffset, YOffset) when Height < IMG#erl_image.height ->
+    IMG1 = IMG#erl_image{ 
+        pixmaps = lists:foldr(fun
+                (PixMap, Acc) when PixMap#erl_pixmap.top >= Height ->
+                    Acc;
+                (PixMap, Acc) when PixMap#erl_pixmap.top + PixMap#erl_pixmap.height =< Height ->
+                    [PixMap|Acc];
+                (PixMap, Acc) ->
+                    [PixMap#erl_pixmap{ 
+                            pixels = lists:sublist(lists:sort(fun({RowA, _}, {RowB, _}) ->
+                                            RowA < RowB
+                                    end, PixMap#erl_pixmap.pixels), 0, Height - PixMap#erl_pixmap.top),
+                            height = Height - PixMap#erl_pixmap.top } | Acc]
+            end, [], IMG#erl_image.pixmaps),
+        height = Height},
+    crop(IMG1, Width, Height, XOffset, YOffset);
+crop(IMG, Width, Height, XOffset, YOffset) when XOffset > 0 ->
+    IMG1 = IMG#erl_image{
+        pixmaps = lists:foldr(fun
+                (PixMap, Acc) when PixMap#erl_pixmap.left + PixMap#erl_pixmap.width < XOffset ->
+                    Acc;
+                (PixMap, Acc) when PixMap#erl_pixmap.left >= XOffset ->
+                    [PixMap#erl_pixmap{ left = PixMap#erl_pixmap.left - XOffset }|Acc];
+                (PixMap, Acc) ->
+                    [PixMap#erl_pixmap{
+                            pixels = lists:map(fun({RowNum, Data}) ->
+                                        {RowNum, binary:part(Data, 
+                                                IMG#erl_image.bytes_pp * XOffset, 
+                                                byte_size(Data) - IMG#erl_image.bytes_pp * XOffset)}
+                                end, PixMap#erl_pixmap.pixels),
+                            width = PixMap#erl_pixmap.width - (XOffset - PixMap#erl_pixmap.left),
+                            left = 0 } | Acc]
+            end, [], IMG#erl_image.pixmaps),
+        width = IMG#erl_image.width - XOffset},
+    crop(IMG1, Width, Height, 0, YOffset);
+crop(IMG, Width, Height, XOffset, YOffset) when Width < IMG#erl_image.width ->
+    IMG1 = IMG#erl_image{
+        pixmaps = lists:foldr(fun
+                (PixMap, Acc) when PixMap#erl_pixmap.left >= Width ->
+                    Acc;
+                (PixMap, Acc) when PixMap#erl_pixmap.left + PixMap#erl_pixmap.width =< Width ->
+                    [PixMap|Acc];
+                (PixMap, Acc) ->
+                    [PixMap#erl_pixmap{
+                            pixels = lists:map(fun({_RowNum, Data}) ->
+                                        binary:part(Data, 0, (Width - PixMap#erl_pixmap.left) * IMG#erl_image.bytes_pp)
+                                end, PixMap#erl_pixmap.pixels),
+                            width = Width - PixMap#erl_pixmap.left } | Acc]
+            end, [], IMG#erl_image.pixmaps),
+        width = Width},
+    crop(IMG1, Width, Height, XOffset, YOffset).
+
+sort_rows(IMG) ->
+    IMG#erl_image{
+        pixmaps = lists:map(fun(Pixmap) ->
+                    Pixmap#erl_pixmap{ 
+                        pixels = lists:sort(fun({RowA, _}, {RowB, _}) ->
+                                    RowA < RowB
+                            end, Pixmap#erl_pixmap.pixels)}
+            end, IMG#erl_image.pixmaps)
+    }.
+
+rows_for_y(Y, IMG) -> lists:map(fun(PixMap) ->
+                {_, Data} = lists:nth(Y - PixMap#erl_pixmap.top + 1, PixMap#erl_pixmap.pixels),
+                Data
+        end, IMG#erl_image.pixmaps).
+
+pmap2(F, L) -> await2(spawn_jobs(F, L)).
+spawn_jobs(F, L) ->
+    Parent = self(),
+    [spawn(fun() -> Parent ! {self(),catch {ok,F(X)}} end) || X <- L].
+await2([H|T]) ->
+    receive
+        {H, {ok, Res}} -> [Res | await2(T)]; {H, {'EXIT',_} = Err} ->
+            [exit(Pid,kill) || Pid <- T],
+            [receive {P,_} -> d_ after 0 -> i_ end || P <- T],
+            erlang:error(Err)
+    end;
+await2([]) -> [].
+
+interpolate_cubic(X, A, B, C, D) ->
+    B + 0.5 * X * (C - A + X * (2*A - 5*B + 4*C - D + X * (3*(B-C) + D - A))).
+
+interpolate_bicubic({X, Y}, {A1, B1, C1, D1}, {A2, B2, C2, D2}, {A3, B3, C3, D3}, {A4, B4, C4, D4}) ->
+    interpolate_cubic(Y, 
+        interpolate_cubic(X, A1, B1, C1, D1),
+        interpolate_cubic(X, A2, B2, C2, D2),
+        interpolate_cubic(X, A3, B3, C3, D3),
+        interpolate_cubic(X, A4, B4, C4, D4)).
+
+get_pixel_bytes(IMG, Rows, X, Y) ->
+    lists:foldr(fun
+            ({PixMap, _}, Pixel) when X < PixMap#erl_pixmap.left; 
+                                 X >= PixMap#erl_pixmap.width + PixMap#erl_pixmap.left;
+                                 Y < PixMap#erl_pixmap.top;
+                                 Y >= PixMap#erl_pixmap.height + PixMap#erl_pixmap.top ->
+                Pixel;
+            ({PixMap, Data}, _Pixel) ->
+                binary:part(Data, (X - PixMap#erl_pixmap.left) * IMG#erl_image.bytes_pp, IMG#erl_image.bytes_pp)
+        end, undefined, lists:zip(IMG#erl_image.pixmaps, Rows)).
+
+nearest_grid_points(Pos, Size) when Pos * Size =< 0.5 ->
+    {0, 0, 0, 1};
+nearest_grid_points(Pos, Size) when Pos * Size < 1.5 ->
+    {0, 0, 1, 2};
+nearest_grid_points(Pos, Size) when Pos * Size >= Size - 0.5 ->
+    {Size - 2, Size - 1, Size - 1, Size - 1};
+nearest_grid_points(Pos, Size) when Pos * Size > Size - 1.5 ->
+    {Size - 3, Size - 2, Size - 1, Size - 1};
+nearest_grid_points(Pos, Size) ->
+    Trunc = trunc(Pos * Size - 0.5),
+    {Trunc - 1, Trunc, Trunc + 1, Trunc + 2}.
+
+clamp(Value, _Depth) when Value < 0 ->
+    0;
+clamp(Value, Depth) when Value > ((1 bsl Depth) - 1) ->
+    (1 bsl Depth) - 1;
+clamp(Value, _Depth) ->
+    Value.
+
+resample_pixels(IMG, NewWidth, NewHeight) ->
+    Depth = IMG#erl_image.depth,
+    % palettes not supported
+    NumChannels = case IMG#erl_image.format of
+        r8g8b8 -> 3;
+        r8g8b8a8 -> 4;
+        r16g16b16 -> 3;
+        r16g16b16a16 -> 4;
+        gray8 -> 1;
+        gray16 -> 1;
+        gray8a8 -> 2;
+        gray8a16 -> 2
+    end,
+
+    BytesPerChannel = IMG#erl_image.bytes_pp div NumChannels,
+
+    pmap2(fun(RowNum) ->
+                YPos = (RowNum + 0.5) / NewHeight,
+                {Ay, By, Cy, Dy} = nearest_grid_points(YPos, IMG#erl_image.height),
+                {Arows, Brows, Crows, Drows} = {
+                    rows_for_y(Ay, IMG),
+                    rows_for_y(By, IMG),
+                    rows_for_y(Cy, IMG),
+                    rows_for_y(Dy, IMG)
+                },
+                RowPixels = lists:map(fun(ColNum) ->
+                            XPos = (ColNum + 0.5) / NewWidth,
+                            {Ax, Bx, Cx, Dx} = nearest_grid_points(XPos, IMG#erl_image.width),
+                            Pos = {XPos * IMG#erl_image.width - Bx - 0.5, YPos * IMG#erl_image.height - By - 0.5},
+
+                            Paa = get_pixel_bytes(IMG, Arows, Ax, Ay),
+                            Pab = get_pixel_bytes(IMG, Arows, Bx, Ay),
+                            Pac = get_pixel_bytes(IMG, Arows, Cx, Ay),
+                            Pad = get_pixel_bytes(IMG, Arows, Dx, Ay),
+
+                            Pba = get_pixel_bytes(IMG, Brows, Ax, By),
+                            Pbb = get_pixel_bytes(IMG, Brows, Bx, By),
+                            Pbc = get_pixel_bytes(IMG, Brows, Cx, By),
+                            Pbd = get_pixel_bytes(IMG, Brows, Dx, By),
+
+                            Pca = get_pixel_bytes(IMG, Crows, Ax, Cy),
+                            Pcb = get_pixel_bytes(IMG, Crows, Bx, Cy),
+                            Pcc = get_pixel_bytes(IMG, Crows, Cx, Cy),
+                            Pcd = get_pixel_bytes(IMG, Crows, Dx, Cy),
+
+                            Pda = get_pixel_bytes(IMG, Drows, Ax, Dy),
+                            Pdb = get_pixel_bytes(IMG, Drows, Bx, Dy),
+                            Pdc = get_pixel_bytes(IMG, Drows, Cx, Dy),
+                            Pdd = get_pixel_bytes(IMG, Drows, Dx, Dy),
+
+                            lists:map(fun(ChannelNum) ->
+                                        <<CHaa:Depth>> = binary:part(Paa, ChannelNum * BytesPerChannel, BytesPerChannel),
+                                        <<CHab:Depth>> = binary:part(Pab, ChannelNum * BytesPerChannel, BytesPerChannel),
+                                        <<CHac:Depth>> = binary:part(Pac, ChannelNum * BytesPerChannel, BytesPerChannel),
+                                        <<CHad:Depth>> = binary:part(Pad, ChannelNum * BytesPerChannel, BytesPerChannel),
+
+                                        <<CHba:Depth>> = binary:part(Pba, ChannelNum * BytesPerChannel, BytesPerChannel),
+                                        <<CHbb:Depth>> = binary:part(Pbb, ChannelNum * BytesPerChannel, BytesPerChannel),
+                                        <<CHbc:Depth>> = binary:part(Pbc, ChannelNum * BytesPerChannel, BytesPerChannel),
+                                        <<CHbd:Depth>> = binary:part(Pbd, ChannelNum * BytesPerChannel, BytesPerChannel),
+
+                                        <<CHca:Depth>> = binary:part(Pca, ChannelNum * BytesPerChannel, BytesPerChannel),
+                                        <<CHcb:Depth>> = binary:part(Pcb, ChannelNum * BytesPerChannel, BytesPerChannel),
+                                        <<CHcc:Depth>> = binary:part(Pcc, ChannelNum * BytesPerChannel, BytesPerChannel),
+                                        <<CHcd:Depth>> = binary:part(Pcd, ChannelNum * BytesPerChannel, BytesPerChannel),
+
+                                        <<CHda:Depth>> = binary:part(Pda, ChannelNum * BytesPerChannel, BytesPerChannel),
+                                        <<CHdb:Depth>> = binary:part(Pdb, ChannelNum * BytesPerChannel, BytesPerChannel),
+                                        <<CHdc:Depth>> = binary:part(Pdc, ChannelNum * BytesPerChannel, BytesPerChannel),
+                                        <<CHdd:Depth>> = binary:part(Pdd, ChannelNum * BytesPerChannel, BytesPerChannel),
+
+                                        CHi = round(clamp(interpolate_bicubic(Pos,
+                                                    {CHaa, CHab, CHac, CHad},
+                                                    {CHba, CHbb, CHbc, CHbd},
+                                                    {CHca, CHcb, CHcc, CHcd},
+                                                    {CHda, CHdb, CHdc, CHdd}), Depth)),
+                                        <<CHi:Depth>>
+                                end, lists:seq(0, NumChannels - 1))
+                    end, lists:seq(0, NewWidth - 1)),
+                {RowNum, iolist_to_binary(RowPixels)}
+        end, lists:seq(0, NewHeight - 1)).
+
+scale(IMG, ScaleFactor) ->
+    scale(IMG, ScaleFactor, ScaleFactor).
+
+scale(IMG, XScaleFactor, YScaleFactor) ->
+    NewHeight = round(YScaleFactor * IMG#erl_image.height),
+    NewWidth = round(XScaleFactor * IMG#erl_image.width),
+    IMG#erl_image{
+        pixmaps = [#erl_pixmap{ 
+                left = 0,
+                top = 0,
+                width = NewWidth,
+                height = NewHeight,
+                pixels = resample_pixels(sort_rows(IMG), NewWidth, NewHeight)}],
+        width = NewWidth,
+        height = NewHeight }.

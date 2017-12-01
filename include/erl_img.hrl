@@ -61,7 +61,7 @@
           filename,     %% Full filename
           size,         %% File size
           extension,    %% extension used
-          mtime,        %% file creation date {{YYYY,MM,DD},{HH,MM,SS}}
+          mtime,        %% file modification date {{YYYY,MM,DD},{HH,MM,SS}}
           itime,        %% image creation date {{YYYY,MM,DD},{HH,MM,SS}}
           comment = "", %% image comment (if present)
           format,       %% pixel format:
@@ -76,6 +76,7 @@
           attributes = [], %% list of attributes [{atom(Key),term(Value)}]
           order,        %% sample order left_to_right or right_to_left
           palette,      %% list [{R,G,B}]
+          alpha_table,  %% list corresponding to palette indexes
           pixmaps = []  %% [#erl_pixmap]
          }).
 

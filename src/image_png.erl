@@ -12,7 +12,6 @@
 
 -import(lists, [reverse/1]).
 -import(erl_img, [attribute/3, set_attribute/3]).
--export([filter/4]).
 
 -define(MAGIC, 137,$P,$N,$G,$\r,$\n,26,$\n).
 
@@ -52,21 +51,26 @@ read_info(Fd) ->
 scan_info(Fd, IMG, First) ->
     case read_chunk_hdr(Fd) of
         {ok, Length, Type} ->
-            scan_info(Fd, IMG, First, Type, Length);
+            Z = zlib:open(),
+            Res = scan_info(Fd, IMG, First, Type, Length, Z),
+            zlib:close(Z),
+			Res;
         Error ->
             Error
     end.
 
-scan_info(Fd, IMG, true, ?IHDR, Length) ->
-    case read_chunk_crc(Fd,Length) of
+scan_info(Fd, IMG, true, ?IHDR, Length, Z) ->
+    case read_chunk_crc(Fd, Length, Z) of
         {ok,  <<Width:32, Height:32, BitDepth:8,
                ColorType:8, CompressionMethod:8,
                FilterMethod:8, InterlaceMethod:8, _/binary >>} ->
+               Format = format(ColorType,BitDepth),
             scan_info(Fd, IMG#erl_image {
                             width = Width,
                             height = Height,
                             depth = BitDepth,
-                            format = format(ColorType,BitDepth),
+                            format = Format,
+                            bytes_pp = bpp(Format),
                             order  = left_to_right,
                             attributes =
                             [ {'ColorType', ColorType},
@@ -75,22 +79,23 @@ scan_info(Fd, IMG, true, ?IHDR, Length) ->
                               {'Interlace', InterlaceMethod }]}, false);
         Error -> Error
     end;
-scan_info(Fd, IMG, false, ?tEXt, Length) ->
-    case read_chunk_crc(Fd, Length) of
+scan_info(Fd, IMG, false, ?tEXt, Length, Z) ->
+    case read_chunk_crc(Fd, Length, Z) of
         {ok, Bin} ->
             scan_info(Fd, update_txt(IMG, Bin), false);
         Error -> Error
     end;
-scan_info(Fd, IMG, false, ?zTXt, Length) ->
-    case read_chunk_crc(Fd, Length) of
-        {ok, CBin} ->
-            Bin = zlib:uncompress(CBin),
-            scan_info(Fd, update_txt(IMG, Bin), false);
+scan_info(Fd, IMG, false, ?zTXt, Length, Z) ->
+    case read_chunk_crc(Fd, Length, Z) of
+        {ok, Bin} ->
+            [Key, CompressedValue] = binary:split(Bin, <<0, 0>>),
+            Value = zlib:uncompress(CompressedValue),
+            scan_info(Fd, set_attribute(IMG, list_to_atom(binary_to_list(Key)), binary_to_list(Value)), false);
         Error -> Error
     end;
-scan_info(Fd, IMG, false, ?bKGD, Length) ->
+scan_info(Fd, IMG, false, ?bKGD, Length, Z) ->
     CT = attribute(IMG, 'ColorType', undefined),
-    case read_chunk_crc(Fd, Length) of
+    case read_chunk_crc(Fd, Length, Z) of
         {ok, <<Index:8>>} when CT==3 ->
             scan_info(Fd, set_attribute(IMG, 'Background', Index), false);
         {ok, <<Gray:16>>} when CT==0; CT==4 ->
@@ -102,8 +107,8 @@ scan_info(Fd, IMG, false, ?bKGD, Length) ->
             scan_info(Fd, IMG, false);
         Error -> Error
     end;
-scan_info(Fd, IMG, false, ?tIME, Length) ->
-    case read_chunk_crc(Fd, Length) of
+scan_info(Fd, IMG, false, ?tIME, Length, Z) ->
+    case read_chunk_crc(Fd, Length, Z) of
         {ok, <<Year:16, Mon:8, Day:8, H:8, M:8, S:8>>} ->
             scan_info(Fd, IMG#erl_image { mtime = {{Year,Mon,Day},
                                                    {H,M,S}} }, false);
@@ -112,8 +117,8 @@ scan_info(Fd, IMG, false, ?tIME, Length) ->
             scan_info(Fd, IMG, false);
         Error -> Error
     end;
-scan_info(Fd, IMG, false, ?pHYs, Length) ->
-    case read_chunk_crc(Fd, Length) of
+scan_info(Fd, IMG, false, ?pHYs, Length, Z) ->
+    case read_chunk_crc(Fd, Length, Z) of
         {ok, <<X:32, Y:32, _Unit:8>>} ->
             scan_info(Fd, set_attribute(IMG,'Physical',{X,Y,meter}),false);
         {ok, _Data} ->
@@ -121,9 +126,20 @@ scan_info(Fd, IMG, false, ?pHYs, Length) ->
             scan_info(Fd, IMG, false);
         Error -> Error
     end;
-scan_info(_Fd, IMG, false, ?IEND, 0) ->
+scan_info(Fd, IMG, false, ?tRNS, Length, Z) ->
+    CT = attribute(IMG, 'ColorType', undefined),
+    case read_chunk_crc(Fd, Length, Z) of
+        {ok, <<Gray:16>>} when CT == 0 ->
+            scan_info(Fd, set_attribute(IMG, 'Transparent', Gray), false);
+        {ok, <<R:16, B:16, G:16>>} when CT == 2 ->
+            scan_info(Fd, set_attribute(IMG, 'Transparent', {R,G,B}), false);
+        {ok, Binary} when CT == 3 ->
+            scan_info(Fd, IMG#erl_image { alpha_table = binary_to_list(Binary) }, false);
+        Error -> Error
+    end;
+scan_info(_Fd, IMG, false, ?IEND, 0, _Z) ->
     {ok, IMG};
-scan_info(Fd, IMG, false, _Type, Length) ->
+scan_info(Fd, IMG, false, _Type, Length, _Z) ->
     ?dbg("~s skipped=~p\n", [_Type,Length]),
     skip_chunk(Fd, Length),
     scan_info(Fd, IMG, false).
@@ -195,6 +211,23 @@ format(4, 16) -> gray16a16;
 format(6, 8)  -> r8g8b8a8;
 format(6, 16) -> r16g16b16a16.
 
+color_type(gray1) -> 0;
+color_type(gray2) -> 0;
+color_type(gray4) -> 0;
+color_type(gray8) -> 0;
+color_type(gray16) -> 0;
+color_type(r8g8b8) -> 2;
+color_type(r16g16b16) -> 2;
+color_type(palette1) -> 3;
+color_type(palette2) -> 3;
+color_type(palette4) -> 3;
+color_type(palette8) -> 3;
+color_type(gray8a8) -> 4;
+color_type(gray16a16) -> 4;
+color_type(r8g8b8a8) -> 6;
+color_type(r16g16b16a16) -> 6.
+
+
 %% process text chunk
 txt([0|Value], RKey) ->
     {value, {list_to_atom(reverse(RKey)), Value}};
@@ -208,8 +241,97 @@ plte(<<R,G,B, Data/binary>>) ->
     [{R,G,B} | plte(Data)];
 plte(<<>>) -> [].
 
-%% IMPLEMENT This:
-write_info(_Fd, _IMG) ->
+write_info(Fd, IMG) ->
+    Z = zlib:open(),
+    write_info(Fd, IMG, Z),
+    zlib:close(Z),
+    ok.
+
+write_info(Fd, IMG, Z) ->
+    file:write(Fd, <<?MAGIC>>),
+    ColorType = color_type(IMG#erl_image.format),
+    write_chunk_crc(Fd, ?IHDR, <<
+        (IMG#erl_image.width):32, 
+        (IMG#erl_image.height):32,
+        (IMG#erl_image.depth):8,
+        ColorType,
+        0, % Compression method
+        0, % Filter method
+        0  % Interlacing
+        >>, Z).
+
+write_chunk_crc(Fd, ChunkName, Chunk, Z) ->
+    Binary = iolist_to_binary(Chunk),
+    Length = byte_size(Binary),
+    ChunkNameBinary = list_to_binary(ChunkName),
+    CRC32 = zlib:crc32(Z, <<ChunkNameBinary/binary, Binary/binary>>),
+    file:write(Fd, <<(Length):32, ChunkNameBinary/binary, Binary/binary, (CRC32):32>>).
+
+write(Fd, IMG) ->
+    Z = zlib:open(),
+    write_info(Fd, IMG, Z),
+    zlib:deflateInit(Z),
+    case IMG#erl_image.format of
+        Format when Format=:=palette1; Format=:=palette2; Format=:=palette4; Format=:=palette8 ->
+            PaletteChunk = << <<R:8, G:8, B:8>> || {R, G, B} <- IMG#erl_image.palette >>,
+            write_chunk_crc(Fd, ?PLTE, PaletteChunk, Z);
+        _ ->
+            ok
+    end,
+    ColorType = color_type(IMG#erl_image.format),
+    case attribute(IMG, 'Background', undefined) of
+        undefined -> ok;
+        Val ->
+            BackgroundChunk = case ColorType of
+                0 -> <<Val:16>>;
+                2 -> {R, G, B} = Val, <<R:16, G:16, B:16>>;
+                3 -> <<Val:8>>;
+                4 -> <<Val:16>>;
+                6 -> {R, G, B} = Val, <<R:16, G:16, B:16>>
+            end,
+            write_chunk_crc(Fd, ?bKGD, BackgroundChunk, Z)
+    end,
+    case attribute(IMG, 'Physical', undefined) of
+        undefined -> ok;
+        {X, Y, meter} -> write_chunk_crc(Fd, ?pHYs, <<X:32, Y:32, 1>>, Z);
+        {X, Y, undefined} -> write_chunk_crc(Fd, ?pHYs, <<X:32, Y:32, 0>>, Z)
+    end,
+    case attribute(IMG, 'Transparent', undefined) of
+        undefined -> ok;
+        TrVal ->
+            TransparentChunk = case ColorType of
+                0 -> <<TrVal:16>>;
+                2 -> {R0, G0, B0} = TrVal, <<R0:16, G0:16, B0:16>>
+            end,
+            write_chunk_crc(Fd, ?tRNS, TransparentChunk, Z)
+    end,
+    case IMG#erl_image.alpha_table of
+        undefined -> ok;
+        List when ColorType =:= 3 -> write_chunk_crc(Fd, ?tRNS, List, Z)
+    end,
+
+    Bpp = bpp(IMG#erl_image.format),
+    FilterMethod = 0,
+
+    PixMap = erlang:hd(IMG#erl_image.pixmaps),
+    {_FinalRow, FilteredData} = lists:foldl(fun
+            ({_RowNum, RowData}, {LastRow, Acc}) ->
+                PixelData = case IMG#erl_image.order of
+                    left_to_right -> RowData
+                end,
+                FilteredBytes = filter(FilterMethod, Bpp, PixelData, LastRow),
+                {PixelData, [[FilterMethod, FilteredBytes]|Acc]}
+        end, {undefined, []},
+        %% Sort by rownum descending, so the output of the foldl will be ascending
+        %%   (as it builds up the result by prepending elements)
+        lists:sort(fun({RowNum1, _Data1}, {RowNum2, _Data2}) ->
+                    RowNum1 > RowNum2
+            end, PixMap#erl_pixmap.pixels)),
+    CompressedData = zlib:deflate(Z, FilteredData, finish),
+    write_chunk_crc(Fd, ?IDAT, CompressedData, Z),
+    zlib:deflateEnd(Z),
+    write_chunk_crc(Fd, ?IEND, <<>>, Z),
+    zlib:close(Z),
     ok.
 
 
@@ -229,13 +351,13 @@ read(Fd, IMG, RowFun, St0) ->
     zlib:close(Z),
     case Resp of
         {ok, Binary, Palette} ->
-            {ok,Pixmap} = create_pixmap(IMG, Binary, Palette, RowFun, St0),
+            {ok,Pixmap} = decode_pixmap(IMG, Binary, Palette, RowFun, St0),
             {ok, IMG#erl_image { pixmaps = [Pixmap],
                                  palette = Palette }};
         Error -> Error
     end.
 
-create_pixmap(IMG, Bin, Palette, RowFun, St0) ->
+decode_pixmap(IMG, Bin, Palette, RowFun, St0) ->
     Interlace = attribute(IMG, 'Interlace', 0),
     Pix0 = #erl_pixmap { width  = IMG#erl_image.width,
                          height = IMG#erl_image.height,
@@ -259,11 +381,11 @@ raw_data(Bin,Pix,RowFun,St0,Ri,Bpp,Width) ->
                         [] -> <<>>;
                         [{_,Row0}|_] -> Row0
                     end,
-            Row1 = filter(Filter,Bpp,Row,Prior), %% Filter method=0 assumed
+            Row1 = reconstruct(Filter,Bpp,Row,Prior), %% Filter method=0 assumed
             St1 = RowFun(Pix,Row1,Ri,St0),
             raw_data(Bin1,Pix,RowFun,St1,Ri+1,Bpp,Width);
         _ ->
-            {ok, Pix#erl_pixmap { pixels = St0 }}
+            {ok, Pix#erl_pixmap { pixels = lists:reverse(St0) }}
     end.
 
 interlaced_data(Bin, Pix0=#erl_pixmap{width=Width, height=Height},
@@ -295,35 +417,35 @@ merge_adam7_row(P, Ri, Bpp, Cols) ->
 
 adam7_pixel(P, Ri, Bpp, Col) when Ri band 1 =:= 1 ->
     %% [7 7 7 7 7 7 7 7]
-    binary_part(array:get(Ri, element(7, P)), Col * Bpp, Bpp);
+    binary:part(array:get(Ri, element(7, P)), Col * Bpp, Bpp);
 adam7_pixel(P, Ri, Bpp, Col) when Ri band 7 =:= 0 andalso Col band 7 =:= 0 ->
     %% [1] 6 4 6 2 6 4 6
-    binary_part(array:get(Ri, element(1, P)), (Col div 8) * Bpp, Bpp);
+    binary:part(array:get(Ri, element(1, P)), (Col div 8) * Bpp, Bpp);
 adam7_pixel(P, Ri, Bpp, Col) when Ri band 7 =:= 0 andalso Col band 1 =:= 1 ->
     %% 1 [6] 4 [6] 2 [6] 4 [6]
-    binary_part(array:get(Ri, element(6, P)), (Col div 2) * Bpp, Bpp);
+    binary:part(array:get(Ri, element(6, P)), (Col div 2) * Bpp, Bpp);
 adam7_pixel(P, Ri, Bpp, Col) when Ri band 7 =:= 0 andalso
                                   (Col band 7 =:= 2 orelse Col band 7 =:= 6) ->
     %% 1 6 [4] 6 2 6 [4] 6
-    binary_part(array:get(Ri, element(4, P)), (Col div 4) * Bpp, Bpp);
+    binary:part(array:get(Ri, element(4, P)), (Col div 4) * Bpp, Bpp);
 adam7_pixel(P, Ri, Bpp, Col) when Ri band 7 =:= 0 andalso
                                   (Col band 7 =:= 2 orelse Col band 7 =:= 4) ->
     %% 1 6 4 6 [2] 6 4 6
-    binary_part(array:get(Ri, element(2, P)), (Col div 8) * Bpp, Bpp);
+    binary:part(array:get(Ri, element(2, P)), (Col div 8) * Bpp, Bpp);
 adam7_pixel(P, Ri, Bpp, Col) when Ri band 7 =:= 2 orelse Ri band 7 =:= 6 ->
     %% [5 6 5 6 5 6 5 6]
-    binary_part(array:get(Ri, element(5 + (Col band 1), P)),
+    binary:part(array:get(Ri, element(5 + (Col band 1), P)),
                 (Col div 2) * Bpp, Bpp);
 adam7_pixel(P, Ri, Bpp, Col) when Ri band 7 =:= 4 andalso Col band 3 =:= 0 ->
     %% [3] 6 4 6 [3] 6 4 6
-    binary_part(array:get(Ri, element(3, P)), (Col div 4) * Bpp, Bpp);
+    binary:part(array:get(Ri, element(3, P)), (Col div 4) * Bpp, Bpp);
 adam7_pixel(P, Ri, Bpp, Col) when Ri band 7 =:= 4 andalso Col band 1 =:= 1 ->
     %% 3 [6] 4 [6] 3 [6] 4 [6]
-    binary_part(array:get(Ri, element(6, P)), (Col div 2) * Bpp, Bpp);
+    binary:part(array:get(Ri, element(6, P)), (Col div 2) * Bpp, Bpp);
 adam7_pixel(P, Ri, Bpp, Col) when Ri band 7 =:= 4 andalso
                                   (Col band 7 =:= 2 orelse Col band 7 =:= 6) ->
     %% 3 6 [4] 6 3 6 [4] 6
-    binary_part(array:get(Ri, element(4, P)), (Col div 4) * Bpp, Bpp).
+    binary:part(array:get(Ri, element(4, P)), (Col div 4) * Bpp, Bpp).
 
 
 
@@ -347,7 +469,7 @@ read_interlaced_data(Bin, Width, Height, RowNum, Bpp, RowLen, RowInc, St0) ->
                         [] -> <<>>;
                         [{_,Row0}|_] -> Row0
                     end,
-            Row1 = filter(Filter,Bpp,Row,Prior), %% Filter method=0 assumed
+            Row1 = reconstruct(Filter,Bpp,Row,Prior), %% Filter method=0 assumed
             read_interlaced_data(Bin1, Width, Height, RowInc + RowNum, Bpp,
                                  RowLen, RowInc,
                                  [{RowNum, Row1} | St0]);
@@ -365,61 +487,68 @@ adam7(starting_row, N) -> element(N, { 0, 0, 4, 0, 2, 0, 1 });
 adam7(col_increment, N) -> element(N, { 8, 8, 4, 4, 2, 2, 1 });
 adam7(row_increment, N) -> element(N, { 8, 8, 8, 4, 4, 2, 2 }).
 
+filter(0, _, Row, _) -> Row.
 
-filter(0,_,Row,_Prior) -> Row;
-filter(1, Bpp, Row, Prior) -> filter_sub(Row,Prior,Bpp);
-filter(2, Bpp, Row,Prior) -> filter_up(Row,Prior,Bpp);
-filter(3, Bpp, Row,Prior) -> filter_avg(Row,Prior,Bpp);
-filter(4, Bpp, Row,Prior) -> filter_paeth(Row,Prior,Bpp).
+reconstruct(0,_,Row,_Prior) -> Row;
+reconstruct(1, Bpp, Row, Prior) -> reconstruct_sub(Row,Prior,Bpp);
+reconstruct(2, Bpp, Row,Prior) -> reconstruct_up(Row,Prior,Bpp);
+reconstruct(3, Bpp, Row,Prior) -> reconstruct_avg(Row,Prior,Bpp);
+reconstruct(4, Bpp, Row,Prior) -> reconstruct_paeth(Row,Prior,Bpp).
 
+%% Neighboring bytes are in the matrix:
+%% c b
+%% a x
+%% See: http://www.w3.org/TR/PNG/#9Filter-types
+
+%% Filt(x) = Orig(x) - Orig(a)
+%% Recon(x) = Filt(x) + Recon(a)  
 %%
-%% Raw(x) = Sub(x) + Raw(x-bpp)  [ Sub(x) = Raw(x) - Raw(x-bpp) ]
-%%
-filter_sub(Sub,_Prior,Bpp) ->
+reconstruct_sub(Sub,_Prior,Bpp) ->
     Rn = lists:duplicate(Bpp, 0),
     Rm = [],
-    filter_sub(Sub, 0, size(Sub), [], Rn, Rm).
+    reconstruct_sub(Sub, 0, size(Sub), [], Rn, Rm).
 
-filter_sub(_Sub, X, X, Acc, _, _) ->
+reconstruct_sub(_Sub, X, X, Acc, _, _) ->
     list_to_binary(reverse(Acc));
-filter_sub(Sub, X, N, Acc, [Rxb|Rn], Rm) ->
+reconstruct_sub(Sub, X, N, Acc, [Rxb|Rn], Rm) ->
     <<_:X/binary, Sx:8, _/binary>> = Sub,
     Rx = (Sx + Rxb) band 16#ff,
     if Rn == [] ->
-            filter_sub(Sub,X+1,N,[Rx|Acc],reverse([Rx|Rm]),[]);
+            reconstruct_sub(Sub,X+1,N,[Rx|Acc],reverse([Rx|Rm]),[]);
        true ->
-            filter_sub(Sub,X+1,N,[Rx|Acc],Rn,[Rx|Rm])
+            reconstruct_sub(Sub,X+1,N,[Rx|Acc],Rn,[Rx|Rm])
     end.
-%%
-%% Raw(x) = Up(x) + Prior(x) [ Up(x) = Raw(x) - Prior(x) ]
-%%
-filter_up(Up, Prior, _Bpp) ->
-    filter_up(Up, Prior, 0, size(Up), []).
 
-filter_up(_Up, _Prior, X, X, Acc) ->
+%% Filt(x) = Orig(x) - Orig(b)
+%% Recon(x) = Filt(x) + Recon(b)
+%%
+reconstruct_up(Up, Prior, _Bpp) ->
+    reconstruct_up(Up, Prior, 0, size(Up), []).
+
+reconstruct_up(_Up, _Prior, X, X, Acc) ->
     list_to_binary(reverse(Acc));
-filter_up(Up, Prior, X, N, Acc) ->
+reconstruct_up(Up, Prior, X, N, Acc) ->
     <<_:X/binary,Ux:8,_/binary>> = Up,
     Px = case Prior of
              <<_:X/binary,Pi,_/binary>> -> Pi;
              _ -> 0
          end,
     Rx = (Ux + Px) band 16#ff,
-    filter_up(Up,Prior,X+1,N,[Rx|Acc]).
+    reconstruct_up(Up,Prior,X+1,N,[Rx|Acc]).
 
 %%
-%% Raw(x) = Avarage(x) + floor((Raw(x-bpp)+Prior(x))/2)
-%%    [ Avarage(x) = Raw(x) - floor((Raw(x-bpp)+Prior(x))/2) ]
+%% Filt(x) = Orig(x) - floor((Orig(a) + Orig(b))/2)
+%% Recon(x) = Filt(x) + floor((Recon(a) + Recon(b))/2)
 %%
 
-filter_avg(Avg, Prior,Bpp) ->
+reconstruct_avg(Avg, Prior,Bpp) ->
     Rn = lists:duplicate(Bpp, 0),
     Rm = [],
-    filter_avg(Avg, Prior,  0, size(Avg), [], Rn, Rm).
+    reconstruct_avg(Avg, Prior,  0, size(Avg), [], Rn, Rm).
 
-filter_avg(_Avg,_Prior, X, X, Acc, _, _) ->
+reconstruct_avg(_Avg,_Prior, X, X, Acc, _, _) ->
     list_to_binary(reverse(Acc));
-filter_avg(Avg, Prior, X, N, Acc, [Rxb|Rn], Rm) ->
+reconstruct_avg(Avg, Prior, X, N, Acc, [Rxb|Rn], Rm) ->
     <<_:X/binary, Ax:8, _/binary>> = Avg,
     Px = case Prior of
              <<_:X/binary,Pi,_/binary>> -> Pi;
@@ -427,26 +556,23 @@ filter_avg(Avg, Prior, X, N, Acc, [Rxb|Rn], Rm) ->
          end,
     Rx = (Ax + ((Rxb+Px) div 2)) band 16#ff,
     if Rn == [] ->
-            filter_avg(Avg,Prior,X+1,N,[Rx|Acc],reverse([Rx|Rm]),[]);
+            reconstruct_avg(Avg,Prior,X+1,N,[Rx|Acc],reverse([Rx|Rm]),[]);
        true ->
-            filter_avg(Avg,Prior,X+1,N,[Rx|Acc],Rn,[Rx|Rm])
+            reconstruct_avg(Avg,Prior,X+1,N,[Rx|Acc],Rn,[Rx|Rm])
     end.
 
+%% Filt(x) = Orig(x) - PaethPredictor(Orig(a),Orig(b),Orig(c))
+%% Recon(x) = Filt(x) + PaethPredictor(Recon(a), Recon(b), Recon(c))
 %%
-%% Paeth(x) = Raw(x) -
-%%            PaethPredictor(Raw(x-bpp),Prior(x),Prior(x-bpp))
-%%
-%% Raw(x) = Paeth(x) + PaethPredictor(Raw(x-bpp),Prior(x),Prior(x-bpp))
-%%
-filter_paeth(Pae,Prior,Bpp) ->
+reconstruct_paeth(Pae,Prior,Bpp) ->
     Pn = Rn = lists:duplicate(Bpp, 0),
     Pm = Rm = [],
-    filter_pae(Pae, Prior, 0, size(Pae), [], Rn, Rm, Pn, Pm).
+    reconstruct_paeth(Pae, Prior, 0, size(Pae), [], Rn, Rm, Pn, Pm).
 
 
-filter_pae(_Pae, _Prior, X, X, Acc, _Rn, _Rm, _Pn, _Pm) ->
+reconstruct_paeth(_Pae, _Prior, X, X, Acc, _Rn, _Rm, _Pn, _Pm) ->
     list_to_binary(reverse(Acc));
-filter_pae(Pae, Prior, X, N, Acc, [Rxb|Rn], Rm, [Pxb|Pn], Pm) ->
+reconstruct_paeth(Pae, Prior, X, N, Acc, [Rxb|Rn], Rm, [Pxb|Pn], Pm) ->
     <<_:X/binary, PAx:8, _/binary>> = Pae,
     Px = case Prior of
              <<_:X/binary,Pi,_/binary>> -> Pi;
@@ -454,11 +580,11 @@ filter_pae(Pae, Prior, X, N, Acc, [Rxb|Rn], Rm, [Pxb|Pn], Pm) ->
          end,
     Rx = (PAx + paethPredictor(Rxb, Px, Pxb)) band 16#ff,
     if Rn == [] ->
-            filter_pae(Pae,Prior,X+1,N,[Rx|Acc],
+            reconstruct_paeth(Pae,Prior,X+1,N,[Rx|Acc],
                        reverse([Rx|Rm]),[],
                        reverse([Px|Pm]),[]);
        true ->
-            filter_pae(Pae,Prior,X+1,N,[Rx|Acc],
+            reconstruct_paeth(Pae,Prior,X+1,N,[Rx|Acc],
                        Rn,[Rx|Rm],
                        Pn,[Px|Pm])
     end.
@@ -485,13 +611,10 @@ paethPredictor(A,B,C) ->
 
 
 
-write(_Fd, _IMG) ->
-    ok.
-
 read_image(Fd, Acc, Palette, Z) ->
     case read_chunk_hdr(Fd) of
         {ok, Length, ?IDAT} ->
-            case read_chunk_crc(Fd, Length) of
+            case read_chunk_crc(Fd, Length, Z) of
                 {ok, CBin} ->
                     Blocks = zlib:inflate(Z, CBin),
                     read_image(Fd, [Blocks|Acc], Palette, Z);
@@ -502,7 +625,7 @@ read_image(Fd, Acc, Palette, Z) ->
             {ok, list_to_binary(reverse(Acc)), Palette};
 
         {ok, Length, ?PLTE} ->
-            case read_chunk_crc(Fd, Length) of
+            case read_chunk_crc(Fd, Length, Z) of
                 {ok, Chunk} ->
                     read_image(Fd, Acc, plte(Chunk), Z);
                 Error ->
@@ -516,12 +639,12 @@ read_image(Fd, Acc, Palette, Z) ->
 %%
 %% Given chunk header read chunk and check crc
 %%
-read_chunk_crc(Fd, Length) ->
+read_chunk_crc(Fd, Length, Z) ->
     file:position(Fd, {cur,-4}),
     LengthWithType = Length+4,
     case file:read(Fd, LengthWithType+4) of
         {ok,<<TypeChunk:LengthWithType/binary, CRC:32>>} ->
-            case valid_crc32(TypeChunk, CRC) of
+            case valid_crc32(TypeChunk, CRC, Z) of
                 true ->
                     <<_:32, Chunk/binary>> = TypeChunk,
                     {ok, Chunk};
@@ -552,10 +675,8 @@ read_chunk_hdr(Fd) ->
 skip_chunk(Fd, Length) ->
     file:position(Fd, {cur,Length+4}).
 
-valid_crc32(Binary, CRC32) ->
-    Z = zlib:open(),
-    Value = zlib:crc32(Z, Binary),
-    zlib:close(Z),
+valid_crc32(Binary, Value, Z) ->
+    CRC32 = zlib:crc32(Z, Binary),
     ?dbg("crc check: ~p == ~p\n", [CRC32, Value]),
     CRC32 == Value.
 
